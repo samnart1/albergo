@@ -9,8 +9,8 @@ requires docker and golang 1.27.
 
 ```bash
 make up                  # postgres 18
-make seed                # a property, two room types, 90 days of rates
 make run                 # api on :8080
+make seed                # a property, two room types, 90 days of rates
 ```
 
 `make seed` prints the ids you need. Then:
