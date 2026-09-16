@@ -1,0 +1,383 @@
+openapi: 3.1.0
+
+info:
+  title: albergo booking engine
+  version: 1.0.0
+  description: >
+    An API for direct hotel booking. Tourists/guests search for available rooms and reserve them; staff use the API to publish inventory and rates. 
+
+servers:
+  - url: http://localhost:8080
+    description: local
+
+tags:
+  - name: guest
+  - name: staff
+  - name: ops
+
+paths:
+  /healthz:
+    get:
+      tags: [ops]
+      summary: Liveness. This never touches the database.
+      security: []
+      responses:
+        "200":
+          description: shows the process is running
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string }
+
+  /readyz:
+    get:
+      tags: [ops]
+      summary: Readiness. This fails when the database is unreachable.
+      security: []
+      responses:
+        "200": { description: ready to serve traffic }
+        "503": { description: a dependency is unavailable }
+
+  /v1/properties/{propertyID}/availability:
+    get:
+      tags: [guest]
+      summary: Priced offers for a stay
+      description: >
+        This returns one offer per bookable rate plan. Options that fail a restriction
+        or have no inventory are left out rather than reporting as errors.
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/PropertyID"
+        - name: check_in
+          in: query
+          required: true
+          schema: { type: string, format: date }
+        - name: check_out
+          in: query
+          required: true
+          description: Exclusive. The departure date is not a night that is sold.
+          schema: { type: string, format: date }
+        - name: guests
+          in: query
+          schema: { type: integer, minimum: 1, default: 2 }
+      responses:
+        "200":
+          description: offers, possibly empty
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Availability" }
+        "400": { $ref: "#/components/responses/Problem" }
+        "404": { $ref: "#/components/responses/Problem" }
+
+  /v1/reservations:
+    post:
+      tags: [guest]
+      summary: Create a reservation
+      description: >
+        Requires an Idempotency-Key. A retry with the same key and the same body
+        returns the original reservation and sets Idempotency-Replayed; the same
+        key with a different body is a conflict.
+      security: []
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string, maxLength: 255 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreateReservation" }
+      responses:
+        "201":
+          description: created, or replayed from an earlier identical request
+          headers:
+            Location:
+              schema: { type: string }
+            Idempotency-Replayed:
+              schema: { type: boolean }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Reservation" }
+        "400": { $ref: "#/components/responses/Problem" }
+        "404": { $ref: "#/components/responses/Problem" }
+        "409":
+          description: sold out, or the idempotency key was reused for another request
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+        "422":
+          description: no rate published, occupancy exceeded, or a stay restriction failed
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+
+  /v1/reservations/{reference}:
+    get:
+      tags: [guest]
+      summary: Fetch a reservation by its booking reference
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/Reference"
+      responses:
+        "200":
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Reservation" }
+          description: the reservation
+        "404": { $ref: "#/components/responses/Problem" }
+
+  /v1/reservations/{reference}/cancel:
+    post:
+      tags: [guest]
+      summary: Cancel a reservation and release the room
+      description: >
+        Cancelling after the refund deadline is allowed and forfeits the refund.
+        Cancelling on or after the check in date is refused.
+      security: []
+      parameters:
+        - $ref: "#/components/parameters/Reference"
+      responses:
+        "200":
+          description: cancelled
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Cancellation" }
+        "404": { $ref: "#/components/responses/Problem" }
+        "409":
+          description: already cancelled, or the stay has started
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+
+  /v1/properties/{propertyID}/room-types/{roomTypeID}/inventory:
+    put:
+      tags: [staff]
+      summary: Publish the allotment for a date range
+      parameters:
+        - $ref: "#/components/parameters/PropertyID"
+        - name: roomTypeID
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [from, to, allotment]
+              properties:
+                from: { type: string, format: date }
+                to: { type: string, format: date, description: Exclusive. }
+                allotment: { type: integer, minimum: 0 }
+      responses:
+        "204": { description: published }
+        "400": { $ref: "#/components/responses/Problem" }
+        "401": { $ref: "#/components/responses/Problem" }
+        "409":
+          description: the new allotment is below what is already booked
+          content:
+            application/problem+json:
+              schema: { $ref: "#/components/schemas/Problem" }
+
+  /v1/properties/{propertyID}/rate-plans/{ratePlanID}/rates:
+    put:
+      tags: [staff]
+      summary: Publish prices and restrictions per date
+      description: Currency comes from the property and is never client supplied.
+      parameters:
+        - $ref: "#/components/parameters/PropertyID"
+        - name: ratePlanID
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [rates]
+              properties:
+                rates:
+                  type: array
+                  minItems: 1
+                  items: { $ref: "#/components/schemas/Rate" }
+      responses:
+        "204": { description: published }
+        "400": { $ref: "#/components/responses/Problem" }
+        "401": { $ref: "#/components/responses/Problem" }
+
+  /v1/properties/{propertyID}/reservations:
+    get:
+      tags: [staff]
+      summary: Reservations arriving in a date range
+      parameters:
+        - $ref: "#/components/parameters/PropertyID"
+        - name: from
+          in: query
+          required: true
+          schema: { type: string, format: date }
+        - name: to
+          in: query
+          required: true
+          schema: { type: string, format: date }
+      responses:
+        "200":
+          description: reservations without their nightly breakdown
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  reservations:
+                    type: array
+                    items: { $ref: "#/components/schemas/Reservation" }
+        "400": { $ref: "#/components/responses/Problem" }
+        "401": { $ref: "#/components/responses/Problem" }
+
+components:
+  securitySchemes:
+    staffKey:
+      type: http
+      scheme: bearer
+      description: Shared staff api key. Replaced by the association identity provider in production.
+
+  parameters:
+    PropertyID:
+      name: propertyID
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    Reference:
+      name: reference
+      in: path
+      required: true
+      schema: { type: string, pattern: "^ALB-[A-Z2-9]{6}$" }
+
+  responses:
+    Problem:
+      description: the request failed
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+
+  schemas:
+    Problem:
+      type: object
+      required: [type, title, status, detail, code]
+      properties:
+        type: { type: string }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        code:
+          type: string
+          description: Stable machine readable cause, for example sold_out or min_stay_not_met.
+      examples:
+        - type: about:blank
+          title: Conflict
+          status: 409
+          detail: the requested dates are sold out
+          code: sold_out
+
+    Money:
+      type: object
+      description: Minor units. A JSON number would be parsed as a float by most clients.
+      required: [amount_cents, currency]
+      properties:
+        amount_cents: { type: integer, format: int64 }
+        currency: { type: string, minLength: 3, maxLength: 3 }
+
+    Night:
+      type: object
+      properties:
+        date: { type: string, format: date }
+        price: { $ref: "#/components/schemas/Money" }
+
+    Rate:
+      type: object
+      required: [date, price_cents, min_stay]
+      properties:
+        date: { type: string, format: date }
+        price_cents: { type: integer, format: int64, minimum: 0 }
+        min_stay: { type: integer, minimum: 1 }
+        closed_to_arrival: { type: boolean, default: false }
+        closed_to_departure: { type: boolean, default: false }
+
+    Offer:
+      type: object
+      properties:
+        room_type_id: { type: string, format: uuid }
+        room_type_name: { type: string }
+        max_occupancy: { type: integer }
+        rate_plan_id: { type: string, format: uuid }
+        rate_plan_code: { type: string }
+        units_left:
+          type: integer
+          description: The scarcest night of the stay.
+        total: { $ref: "#/components/schemas/Money" }
+        nights:
+          type: array
+          items: { $ref: "#/components/schemas/Night" }
+
+    Availability:
+      type: object
+      properties:
+        check_in: { type: string, format: date }
+        check_out: { type: string, format: date }
+        nights: { type: integer }
+        offers:
+          type: array
+          items: { $ref: "#/components/schemas/Offer" }
+
+    CreateReservation:
+      type: object
+      required: [property_id, room_type_id, rate_plan_id, check_in, check_out, guests, guest]
+      properties:
+        property_id: { type: string, format: uuid }
+        room_type_id: { type: string, format: uuid }
+        rate_plan_id: { type: string, format: uuid }
+        check_in: { type: string, format: date }
+        check_out: { type: string, format: date }
+        guests: { type: integer, minimum: 1 }
+        guest:
+          type: object
+          required: [email, full_name]
+          properties:
+            email: { type: string, format: email }
+            full_name: { type: string }
+            phone: { type: string }
+
+    Reservation:
+      type: object
+      properties:
+        reference: { type: string }
+        status: { type: string, enum: [confirmed, cancelled] }
+        property_id: { type: string, format: uuid }
+        room_type_id: { type: string, format: uuid }
+        rate_plan_id: { type: string, format: uuid }
+        check_in: { type: string, format: date }
+        check_out: { type: string, format: date }
+        guests: { type: integer }
+        total: { $ref: "#/components/schemas/Money" }
+        nights:
+          type: array
+          items: { $ref: "#/components/schemas/Night" }
+        created_at: { type: string, format: date-time }
+        cancelled_at: { type: [string, "null"], format: date-time }
+
+    Cancellation:
+      type: object
+      properties:
+        reservation: { $ref: "#/components/schemas/Reservation" }
+        refund: { $ref: "#/components/schemas/Money" }
+        refundable:
+          type: boolean
+          description: False when cancelled after the refund deadline.
+
+security:
+  - staffKey: []

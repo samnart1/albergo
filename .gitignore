@@ -1,0 +1,6 @@
+/bin/
+*.out
+.env
+.terraform/
+terraform.tfstate*
+*.tfvars
